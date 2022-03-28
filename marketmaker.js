@@ -17,6 +17,9 @@ const CHAINLINK_PROVIDERS = {};
 const UNISWAP_V3_PROVIDERS = {};
 const PAST_ORDER_LIST = {};
 
+let uniswap_error_counter = 0;
+let chainlink_error_counter = 0;
+
 // Load MM config
 let MM_CONFIG;
 if (process.env.MM_CONFIG) {
@@ -109,7 +112,7 @@ zigzagws.on('error', console.error);
 
 function onWsOpen() {
     zigzagws.on('message', handleMessage);
-    fillOrdersInterval = setInterval(fillOpenOrders, 1000);
+    fillOrdersInterval = setInterval(fillOpenOrders, 200);
     indicateLiquidityInterval = setInterval(indicateLiquidity, 5000);
     for (let market in MM_CONFIG.pairs) {
         if (MM_CONFIG.pairs[market].active) {
@@ -150,7 +153,10 @@ async function handleMessage(json) {
                 if (fillable.fillable) {
                     sendFillRequest(order, fillable.walletId);
                 }
-                else if (fillable.reason === "badprice") {
+                else if ([
+                  "sending order already",
+                  "badprice"
+                ].includes(fillable.reason)) {
                     OPEN_ORDERS[orderId] = order;
                 }
             });
@@ -231,7 +237,7 @@ function isOrderFillable(order) {
     });
 
     if (goodWalletIds.length === 0) {
-        return { fillable: false, reason: "sending order already " };
+        return { fillable: false, reason: "sending order already" };
     }
 
     const now = Date.now() / 1000 | 0;
@@ -269,33 +275,33 @@ function isOrderFillable(order) {
 }
 
 function genQuote(chainId, marketId, side, baseQuantity) {
-    const market = MARKETS[marketId];
-    if (CHAIN_ID !== chainId) throw new Error("badchain");
-    if (!market) throw new Error("badmarket");
-    if (!(['b','s']).includes(side)) throw new Error("badside");
-    if (baseQuantity <= 0) throw new Error("badquantity");
+  const market = MARKETS[marketId];
+  if (CHAIN_ID !== chainId) throw new Error("badchain");
+  if (!market) throw new Error("badmarket");
+  if (!(['b','s']).includes(side)) throw new Error("badside");
+  if (baseQuantity <= 0) throw new Error("badquantity");
 
-    validatePriceFeed(marketId);
+  validatePriceFeed(marketId);
 
-    const mmConfig = MM_CONFIG.pairs[marketId];
-    const mmSide = mmConfig.side || 'd';
-    if (mmSide !== 'd' && mmSide === side) {
-        throw new Error("badside");
-    }
-    const primaryPrice = PRICE_FEEDS[mmConfig.priceFeedPrimary];
-    if (!primaryPrice) throw new Error("badprice");
-    const SPREAD = mmConfig.minSpread + (baseQuantity * mmConfig.slippageRate);
-    let quoteQuantity;
-    if (side === 'b') {
-        quoteQuantity = (baseQuantity * primaryPrice * (1 + SPREAD)) + market.quoteFee;
-    }
-    else if (side === 's') {
-        quoteQuantity = (baseQuantity - market.baseFee) * primaryPrice * (1 - SPREAD);
-    }
-    const quotePrice = (quoteQuantity / baseQuantity).toPrecision(6);
-    if (quotePrice < 0) throw new Error("Amount is inadequate to pay fee");
-    if (isNaN(quotePrice)) throw new Error("Internal Error. No price generated.");
-    return { quotePrice, quoteQuantity };
+  const mmConfig = MM_CONFIG.pairs[marketId];
+  const mmSide = mmConfig.side || 'd';
+  if (mmSide !== 'd' && mmSide === side) {
+      throw new Error("badside");
+  }
+  const primaryPrice = PRICE_FEEDS[mmConfig.priceFeedPrimary];
+  if (!primaryPrice) throw new Error("badprice");
+  const SPREAD = mmConfig.minSpread + (baseQuantity * mmConfig.slippageRate);
+  let quoteQuantity;
+  if (side === 'b') {
+      quoteQuantity = (baseQuantity * primaryPrice * (1 + SPREAD)) + market.quoteFee;
+  }
+  else if (side === 's') {
+      quoteQuantity = (baseQuantity - market.baseFee) * primaryPrice * (1 - SPREAD);
+  }
+  const quotePrice = (quoteQuantity / baseQuantity).toPrecision(6);
+  if (quotePrice < 0) throw new Error("Amount is inadequate to pay fee");
+  if (isNaN(quotePrice)) throw new Error("Internal Error. No price generated.");
+  return { quotePrice, quoteQuantity };
 }
 
 function validatePriceFeed(marketId) {
@@ -325,79 +331,79 @@ function validatePriceFeed(marketId) {
     // If the secondary price feed varies from the primary price feed by more than 1%, assume something is broken
     const percentDiff = Math.abs(primaryPrice - secondaryPrice) / primaryPrice;
     if (percentDiff > 0.03) {
-        throw new Error("Circuit breaker triggered");
-        console.error("Primary and secondary price feeds do not match!");
+      console.error("Primary and secondary price feeds do not match!");
+      throw new Error("Circuit breaker triggered");
     }
 
     return true;
 }
 
 async function sendFillRequest(orderreceipt, accountId) {
-    const chainId = orderreceipt[0];
-    const orderId = orderreceipt[1];
-    const marketId = orderreceipt[2];
-    const market = MARKETS[marketId];
-    const baseCurrency = market.baseAssetId;
-    const quoteCurrency = market.quoteAssetId;
-    const side = orderreceipt[3];
-    const baseQuantity = orderreceipt[5];
-    const quoteQuantity = orderreceipt[6];
-    const quote = genQuote(chainId, marketId, side, baseQuantity);
-    let tokenSell, tokenBuy, sellQuantity, buyQuantity, buySymbol, sellSymbol;
-    if (side === "b") {
-        tokenSell = market.baseAssetId;
-        tokenBuy = market.quoteAssetId;
-        sellSymbol = market.baseAsset.symbol;
-        buySymbol = market.quoteAsset.symbol;
-        // Add 1 bip to to protect against rounding errors
-        sellQuantity = (baseQuantity * 1.0001).toFixed(market.baseAsset.decimals);
-        buyQuantity = (quote.quoteQuantity * 0.9999).toFixed(market.quoteAsset.decimals);
-    } else if (side === "s") {
-        tokenSell = market.quoteAssetId;
-        tokenBuy = market.baseAssetId;
-        sellSymbol = market.quoteAsset.symbol;
-        buySymbol = market.baseAsset.symbol;
-        // Add 1 bip to to protect against rounding errors
-        sellQuantity = (quote.quoteQuantity * 1.0001).toFixed(market.quoteAsset.decimals);
-        buyQuantity = (baseQuantity * 0.9999).toFixed(market.baseAsset.decimals);
-    }
-    const sellQuantityParsed = syncProvider.tokenSet.parseToken(
-        tokenSell,
-        sellQuantity
-    );
-    const sellQuantityPacked = zksync.utils.closestPackableTransactionAmount(sellQuantityParsed);
-    const tokenRatio = {};
-    tokenRatio[tokenBuy] = buyQuantity;
-    tokenRatio[tokenSell] = sellQuantity;
-    const oneMinExpiry = (Date.now() / 1000 | 0) + 60;
-    const orderDetails = {
-        tokenSell,
-        tokenBuy,
-        amount: sellQuantityPacked,
-        ratio: zksync.utils.tokenRatio(tokenRatio),
-        validUntil: oneMinExpiry
-    }
-    const fillOrder = await WALLETS[accountId].syncWallet.getOrder(orderDetails);
+  const chainId = orderreceipt[0];
+  const orderId = orderreceipt[1];
+  const marketId = orderreceipt[2];
+  const market = MARKETS[marketId];
+  const baseCurrency = market.baseAssetId;
+  const quoteCurrency = market.quoteAssetId;
+  const side = orderreceipt[3];
+  const baseQuantity = orderreceipt[5];
+  const quoteQuantity = orderreceipt[6];
+  const quote = genQuote(chainId, marketId, side, baseQuantity);
+  let tokenSell, tokenBuy, sellQuantity, buyQuantity, buySymbol, sellSymbol;
+  if (side === "b") {
+      tokenSell = market.baseAssetId;
+      tokenBuy = market.quoteAssetId;
+      sellSymbol = market.baseAsset.symbol;
+      buySymbol = market.quoteAsset.symbol;
+      // Add 1 bip to to protect against rounding errors
+      sellQuantity = (baseQuantity * 1.0001).toFixed(market.baseAsset.decimals);
+      buyQuantity = (quote.quoteQuantity * 0.9999).toFixed(market.quoteAsset.decimals);
+  } else if (side === "s") {
+      tokenSell = market.quoteAssetId;
+      tokenBuy = market.baseAssetId;
+      sellSymbol = market.quoteAsset.symbol;
+      buySymbol = market.baseAsset.symbol;
+      // Add 1 bip to to protect against rounding errors
+      sellQuantity = (quote.quoteQuantity * 1.0001).toFixed(market.quoteAsset.decimals);
+      buyQuantity = (baseQuantity * 0.9999).toFixed(market.baseAsset.decimals);
+  }
+  const sellQuantityParsed = syncProvider.tokenSet.parseToken(
+      tokenSell,
+      sellQuantity
+  );
+  const sellQuantityPacked = zksync.utils.closestPackableTransactionAmount(sellQuantityParsed);
+  const tokenRatio = {};
+  tokenRatio[tokenBuy] = buyQuantity;
+  tokenRatio[tokenSell] = sellQuantity;
+  const oneMinExpiry = (Date.now() / 1000 | 0) + 60;
+  const orderDetails = {
+      tokenSell,
+      tokenBuy,
+      amount: sellQuantityPacked,
+      ratio: zksync.utils.tokenRatio(tokenRatio),
+      validUntil: oneMinExpiry
+  }
+  const fillOrder = await WALLETS[accountId].syncWallet.getOrder(orderDetails);
 
-    // Set wallet flag
-    WALLETS[accountId]['ORDER_BROADCASTING'] = true;
+  // Set wallet flag
+  WALLETS[accountId]['ORDER_BROADCASTING'] = true;
 
-    // ORDER_BROADCASTING should not take longer as 5 sec
-    setTimeout(function() {
-        WALLETS[accountId]['ORDER_BROADCASTING'] = false;
-    }, 5000);
+  // ORDER_BROADCASTING should not take longer as 5 sec
+  setTimeout(function() {
+      WALLETS[accountId]['ORDER_BROADCASTING'] = false;
+  }, 5000);
 
-    const resp = { op: "fillrequest", args: [chainId, orderId, fillOrder] };
-    zigzagws.send(JSON.stringify(resp));
-    rememberOrder(chainId,
-        marketId,
-        orderId, 
-        quote.quotePrice, 
-        sellSymbol,
-        sellQuantity,
-        buySymbol,
-        buyQuantity
-    );
+  const resp = { op: "fillrequest", args: [chainId, orderId, fillOrder] };
+  zigzagws.send(JSON.stringify(resp));
+  rememberOrder(chainId,
+      marketId,
+      orderId, 
+      quote.quotePrice, 
+      sellSymbol,
+      sellQuantity,
+      buySymbol,
+      buyQuantity
+  );
 }
 
 async function broadcastFill(chainId, orderId, swapOffer, fillOrder, wallet) {
@@ -457,8 +463,10 @@ async function fillOpenOrders() {
         if (fillable.fillable) {
             sendFillRequest(order, fillable.walletId);
             delete OPEN_ORDERS[orderId];
-        }
-        else if (fillable.reason !== "badprice") {
+        }else if (![
+            "sending order already",
+            "badprice"
+          ].includes(fillable.reason)) {
             delete OPEN_ORDERS[orderId];
         }
     }
@@ -587,11 +595,20 @@ async function chainlinkSetup(chainlinkMarketAddress) {
 }
 
 async function chainlinkUpdate() {
-    await Promise.all(Object.keys(CHAINLINK_PROVIDERS).map(async (key) => {
-        const [provider, decimals] = CHAINLINK_PROVIDERS[key];
-        const response = await provider.latestRoundData();
-        PRICE_FEEDS[key] = parseFloat(response.answer) / 10**decimals;
-    }));
+    try {
+        await Promise.all(Object.keys(CHAINLINK_PROVIDERS).map(async (key) => {
+            const [provider, decimals] = CHAINLINK_PROVIDERS[key];
+            const response = await provider.latestRoundData();
+            PRICE_FEEDS[key] = parseFloat(response.answer) / 10**decimals;
+        }));
+        chainlink_error_counter = 0;
+    } catch (err) {
+        chainlink_error_counter += 1;
+        console.log(`Failed to update chainlink, retry: ${err.message}`);
+        if(chainlink_error_counter > 4) {
+            throw new Error ("Failed to update chainlink since 150 seconds!")
+        }
+    }
 }
 
 async function uniswapV3Setup(uniswapV3Address) {
@@ -639,11 +656,22 @@ async function uniswapV3Setup(uniswapV3Address) {
 }
 
 async function uniswapV3Update() {
-    await Promise.all(Object.keys(UNISWAP_V3_PROVIDERS).map(async (key) => {
-        const [provider, decimalsRatio] = UNISWAP_V3_PROVIDERS[key];
-        const slot0 = await provider.slot0();
-        PRICE_FEEDS[key] = (slot0.sqrtPriceX96*slot0.sqrtPriceX96*decimalsRatio) / (2**192);
-    }));    
+    try {
+        await Promise.all(Object.keys(UNISWAP_V3_PROVIDERS).map(async (key) => {
+            const [provider, decimalsRatio] = UNISWAP_V3_PROVIDERS[key];
+            const slot0 = await provider.slot0();
+            PRICE_FEEDS[key] = (slot0.sqrtPriceX96*slot0.sqrtPriceX96*decimalsRatio) / (2**192);
+        }));
+        // reset error counter if successful 
+        uniswap_error_counter = 0;
+    } catch (err) {
+        uniswap_error_counter += 1;
+        console.log(`Failed to update uniswap, retry: ${err.message}`);
+        console.log(err.message);
+        if(uniswap_error_counter > 4) {
+            throw new Error ("Failed to update uniswap since 150 seconds!")
+        }
+    }
 }
 
 function indicateLiquidity (pairs = MM_CONFIG.pairs) {
